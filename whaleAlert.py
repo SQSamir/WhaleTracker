@@ -1,4 +1,4 @@
-# file: whale_signal_bot_advanced.py
+# file: whale_signal_bot_advanced_full.py
 # Python 3.10+
 import asyncio, json, ssl, time, math, os, logging
 from datetime import datetime, timedelta
@@ -8,6 +8,11 @@ from enum import Enum
 import websockets, aiohttp
 import pandas as pd
 from dotenv import load_dotenv
+
+# Telegram interaktivliyi üçün aiogram
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
 load_dotenv()
 
@@ -22,38 +27,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger('WhaleBot')
 
-# --- Konfiqurasiya (Dəyişdirilməyib) ---
+# --- Konfiqurasiya ---
 class Config:
+    # TELEGRAM_TOKEN və TELEGRAM_CHAT_ID .env faylından gəlir
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     
     SYMBOLS = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT"]
-    BIG_TRADE_USDT = 1_000
+    BIG_TRADE_USDT = 1000
     HUGE_TRADE_USDT = 2_000_000
     MIN_LIQ_NOTIONAL = 100_000
     
-    # ATR Settings
     ATR_MINUTES = 1
     ATR_PERIOD = 14
     
-    # Risk Management
     ENTRY_OFFSET_ATR = 0.15
     SL_ATR = 1.8
     TP1_ATR, TP2_ATR, TP3_ATR = 1.0, 2.0, 3.0
     RISK_PER_TRADE_PCT = 0.5
     
-    # Siqnal Təsdiq Pəncərəsi
-    CONFIRM_WINDOW_SEC = 300
+    CONFIRM_WINDOW_SEC = 300  # 5 dəqiqə
     OI_BUMP_PCT = 0.3
     FUNDING_TICK = 0.0001
     
-    # Volume Analysis
     VOLUME_SPIKE_MULTIPLIER = 2.5
     
-    # Cooldown Mechanism
     COOLDOWN_MINUTES = 30
     
-    # VWAP Settings
     VWAP_BARS = 100
 
 class SignalType(Enum):
@@ -82,6 +82,7 @@ class Signal:
 
 @dataclass
 class MarketState:
+    # Məlumat Konsistensiyasını təmin etmək üçün Lock
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     
     price: float = 0.0
@@ -105,8 +106,19 @@ class AdvancedWhaleBot:
         self.states: Dict[str, MarketState] = {symbol: MarketState() for symbol in config.SYMBOLS}
         self.cooldown_until: Dict[str, datetime] = {symbol: datetime.now() for symbol in config.SYMBOLS}
         self.session: Optional[aiohttp.ClientSession] = None
-    
-    # (Helper functions, initialize, close - dəyişdirilməyib)
+        
+        # Telegram Bot və Dispatcher init
+        if self.config.TELEGRAM_TOKEN and self.config.TELEGRAM_CHAT_ID:
+            self.tg_bot = Bot(token=self.config.TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+            self.dp = Dispatcher()
+            
+            # Komandaların qeydiyyatı
+            self.dp.message.register(self.handle_start, commands=["start", "help"])
+            self.dp.message.register(self.handle_price, commands=["price"])
+            self.dp.message.register(self.handle_status, commands=["status"])
+        else:
+            self.tg_bot = None
+            self.dp = None
 
     # --- Formatting Helpers ---
     def fmt_usd(self, x: float) -> str:
@@ -126,29 +138,120 @@ class AdvancedWhaleBot:
     async def close(self):
         if self.session:
             await self.session.close()
+        if self.tg_bot:
+            await self.tg_bot.session.close()
 
-    async def tg_send(self, text: str, reply_markup=None):
-        if not (self.config.TELEGRAM_TOKEN and self.config.TELEGRAM_CHAT_ID):
+    # --- Telegram Notification (Avtomatik Siqnallar üçün) ---
+    async def tg_send(self, text: str, reply_markup=None, chat_id: Optional[str] = None):
+        target_chat_id = chat_id or self.config.TELEGRAM_CHAT_ID
+        
+        if not (self.config.TELEGRAM_TOKEN and target_chat_id):
             logger.info(f"Telegram: {text[:100]}...")
             return
         
-        url = f"https://api.telegram.org/bot{self.config.TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": self.config.TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
+        if not self.tg_bot: return 
         
         try:
-            async with self.session.post(url, json=payload, timeout=5) as response:
-                if response.status != 200:
-                    logger.error(f"Telegram error: {response.status} - {await response.text()}")
+            await self.tg_bot.send_message(
+                chat_id=target_chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except TelegramBadRequest as e:
+            logger.error(f"Telegram send error (Bad Request): {e} - {text[:50]}...")
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
-    
+
+    # --- Telegram Komanda İşləyiciləri (İnteraktiv Rejim) ---
+
+    async def _check_chat_auth(self, message: types.Message) -> bool:
+        if str(message.chat.id) != self.config.TELEGRAM_CHAT_ID:
+            # logger.warning(f"Unauthorized access attempt from chat ID: {message.chat.id}")
+            await message.reply("⚠️ Səlahiyyətiniz yoxdur. Bu funksiyadan istifadə edə bilmək üçün chat ID-niz botun konfiqurasiya faylında olmalıdır.")
+            return False
+        return True
+
+    async def handle_start(self, message: types.Message):
+        if not await self._check_chat_auth(message): return
+        
+        text = (
+            "🤖 <b>Advanced Whale Signal Bot (Interaktiv)</b>\n\n"
+            "Mövcud Komandalar:\n"
+            "• /price [SYMBOL] - Simvolun cari qiymətini və bazar datalarını göstər.\n"
+            "  Məs: <code>/price BTCUSDT</code>\n"
+            "• /status - Botun monitorinq etdiyi simvolları və soyuma müddətlərini göstər."
+        )
+        await message.reply(text)
+
+    async def handle_price(self, message: types.Message):
+        if not await self._check_chat_auth(message): return
+        
+        try:
+            symbol = message.text.split()[1].upper()
+        except IndexError:
+            return await message.reply("Simvolu qeyd edin. Məs: <code>/price BTCUSDT</code>")
+
+        if symbol not in self.config.SYMBOLS:
+            return await message.reply(f"Mən <code>{symbol}</code> simvolunu izləmirəm. İzlənilən: {', '.join(self.config.SYMBOLS)}")
+
+        state = self.states[symbol]
+        
+        async with state.lock:
+            if state.price == 0.0 or state.atr == 0.0 or state.vwap == 0.0:
+                return await message.reply(f"Xahiş edirik gözləyin. <code>{symbol}</code> üçün bazar məlumatları hələ tam yüklənməyib.")
+            
+            vwap_status = "Tərəfsiz"
+            if state.vwap > 0:
+                 vwap_diff = (state.price - state.vwap) / state.vwap * 100
+                 if vwap_diff > 0.1:
+                    vwap_status = f"🟢 Üstün ({vwap_diff:+.2f}% yuxarı)"
+                 elif vwap_diff < -0.1:
+                    vwap_status = f"🔴 Aşağı ({vwap_diff:+.2f}% aşağı)"
+
+            text = f"""
+📈 <b>{symbol} Bazar Data İcmalı</b>
+
+<b>Cari Qiymət:</b> ${state.price:,.2f}
+<b>ATR (14m):</b> ${state.atr:.2f}
+<b>VWAP (100m):</b> ${state.vwap:,.2f}
+VWAP Vəziyyəti: {vwap_status}
+
+<b>Makro Data:</b>
+• OI Dəyişikliyi (30m): {self.fmt_pct(state.oi_change)}
+• Funding Rate: {state.funding:.4f}
+• 24h Həcm: {self.fmt_usd(state.volume_24h)}
+
+<b>Son Balina Aktivliyi (Son {self.config.CONFIRM_WINDOW_SEC // 60} dəq):</b>
+• Alış Gücü: {self.fmt_usd(sum(n for _, n in state.big_buys))}
+• Satış Gücü: {self.fmt_usd(sum(n for _, n in state.big_sells))}
+"""
+        await message.reply(text)
+
+    async def handle_status(self, message: types.Message):
+        if not await self._check_chat_auth(message): return
+
+        status_messages = ["📊 <b>Bot Statusu və Soyuma Müddətləri</b>\n"]
+        now = datetime.now()
+        
+        for symbol in self.config.SYMBOLS:
+            cooldown_time = self.cooldown_until[symbol]
+            status = "Hazırdır 🟢"
+            
+            if cooldown_time > now:
+                remaining_sec = (cooldown_time - now).total_seconds()
+                minutes = math.ceil(remaining_sec / 60)
+                status = f"Soyumada ({minutes} dəq qaldı) 🟡"
+            
+            last_signal = self.states[symbol].last_signal_time
+            last_signal_str = last_signal.strftime('%H:%M:%S') if last_signal else "Yoxdur"
+            
+            status_messages.append(f"• <b>{symbol}:</b> {status} (Son Siqnal: {last_signal_str})")
+
+        await message.reply('\n'.join(status_messages))
+        
+    # --- API Helpers (Dəyişdirilməyib) ---
     async def fetch_json(self, url: str, params: dict = None) -> Optional[dict]:
         for attempt in range(3):
             try:
@@ -173,13 +276,12 @@ class AdvancedWhaleBot:
     
     async def get_oi_change_pct(self, symbol: str) -> float:
         url = "https://fapi.binance.com/futures/data/openInterestHist"
-        # Son 6 * 5 dəqiqə = 30 dəqiqəlik dəyişiklik üçün
         data = await self.fetch_json(url, {"symbol": symbol, "period": "5m", "limit": 6})
         if not data or len(data) < 2:
             return 0.0
         
         last = float(data[-1]["sumOpenInterest"])
-        prev = float(data[0]["sumOpenInterest"]) # 30 dəqiqə əvvəlki dəyər
+        prev = float(data[0]["sumOpenInterest"]) 
         return (last - prev) / prev * 100.0 if prev != 0 else 0.0
     
     async def get_funding_rate(self, symbol: str) -> float:
@@ -187,7 +289,7 @@ class AdvancedWhaleBot:
         data = await self.fetch_json(url, {"symbol": symbol})
         return float(data.get("lastFundingRate", 0)) if data else 0.0
     
-    # --- Technical Indicators ---
+    # --- Technical Indicators (Dəyişdirilməyib) ---
     def calc_atr(self, klines: List) -> float:
         if len(klines) < self.config.ATR_PERIOD:
             return 0.0
@@ -204,11 +306,8 @@ class AdvancedWhaleBot:
         return sum(trs[-self.config.ATR_PERIOD:]) / self.config.ATR_PERIOD
 
     def calc_vwap(self, klines: List) -> float:
-        if not klines:
-            return 0.0
-        
+        if not klines: return 0.0
         klines_to_use = klines[-self.config.VWAP_BARS:]
-        
         typical_prices = []
         volumes = []
         
@@ -221,25 +320,19 @@ class AdvancedWhaleBot:
         total_notional = sum(volumes)
         total_volume = sum(float(kline[5]) for kline in klines_to_use)
 
-        if total_volume == 0:
-             return 0.0
-        
+        if total_volume == 0: return 0.0
         return total_notional / total_volume
 
     def calc_avg_volume(self, klines: List) -> float:
-        """Son 60 barın (1 saat) notional həcminin ortalamasını hesablayır"""
-        if not klines or len(klines) < 60:
-            return 0.0
-        
+        if not klines or len(klines) < 60: return 0.0
         volumes = []
         for kline in klines[-60:]:
             price = float(kline[4])
             volume = float(kline[5])
             volumes.append(price * volume)
-            
         return sum(volumes) / len(volumes)
 
-    # --- Signal Logic ---
+    # --- Signal Logic (Dəyişdirilməyib) ---
     def build_levels(self, side: SignalType, price: float, atr: float) -> Tuple[float, float, float, float, float]:
         if side == SignalType.LONG:
             entry = price + self.config.ENTRY_OFFSET_ATR * atr
@@ -298,10 +391,10 @@ class AdvancedWhaleBot:
         # Open Interest
         if state.oi_change >= self.config.OI_BUMP_PCT:
             long_score += 20
-            reasons.append(f"📈 OI artımı (30m): {self.fmt_pct(state.oi_change)}") # DÜZƏLİŞ: 30d -> 30m
+            reasons.append(f"📈 OI artımı (30m): {self.fmt_pct(state.oi_change)}")
         elif state.oi_change <= -self.config.OI_BUMP_PCT:
             short_score += 20
-            reasons.append(f"📉 OI azalması (30m): {self.fmt_pct(state.oi_change)}") # DÜZƏLİŞ: 30d -> 30m
+            reasons.append(f"📉 OI azalması (30m): {self.fmt_pct(state.oi_change)}")
         
         # Volume Spike
         if state.volume_24h > state.avg_volume_1h * self.config.VOLUME_SPIKE_MULTIPLIER:
@@ -357,7 +450,7 @@ class AdvancedWhaleBot:
             
             signal_type, strength, confidence, reasons = self.analyze_signal_strength(state)
             
-            # DÜZƏLİŞ: Siqnal guard - ATR, Price və VWAP yoxlanılır.
+            # Siqnal guard: ATR, Price və VWAP yoxlanılır.
             if signal_type and state.atr > 0 and state.price > 0 and state.vwap > 0: 
                 entry, sl, tp1, tp2, tp3 = self.build_levels(signal_type, state.price, state.atr)
                 position_size, risk_amount = self.calculate_position_size(entry, sl)
@@ -399,6 +492,7 @@ class AdvancedWhaleBot:
                     funding=state.funding
                 )
     
+    # --- Signal Message (Dəyişdirilməyib) ---
     async def send_signal_message(self, signal: Signal, position_size: float, risk_amount: float):
         emoji = "🟢" if signal.signal_type == SignalType.LONG else "🔴"
         direction = "LONG" if signal.signal_type == SignalType.LONG else "SHORT"
@@ -443,6 +537,7 @@ class AdvancedWhaleBot:
         await self.tg_send(message, keyboard)
         logger.info(f"Signal sent for {signal.symbol}: {direction} (Strength: {signal.strength})")
     
+    # --- Data Polling ---
     async def market_data_poller(self):
         logger.info("Starting market data poller")
         
@@ -475,6 +570,7 @@ class AdvancedWhaleBot:
                 logger.error(f"Market data poller error: {e}")
                 await asyncio.sleep(30)
     
+    # --- WebSocket Handler ---
     async def websocket_handler(self):
         streams = ["!forceOrder@arr"] + [f"{s.lower()}@aggTrade" for s in self.config.SYMBOLS]
         url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
@@ -501,7 +597,6 @@ class AdvancedWhaleBot:
     async def process_websocket_message(self, stream: str, payload: dict):
         current_time = time.time()
         
-        # DÜZƏLİŞ: Liquidation stream match
         if stream == "!forceOrder@arr":
             orders = payload if isinstance(payload, list) else [payload]
             for order in orders:
@@ -519,7 +614,7 @@ class AdvancedWhaleBot:
         
         state = self.states[symbol]
         async with state.lock:
-            side = order_data.get("S")
+            side = order_data.get("S") 
             quantity = float(order_data.get("q", "0"))
             price = float(order_data.get("p", "0"))
             notional = quantity * price
@@ -553,32 +648,58 @@ class AdvancedWhaleBot:
                 
                 is_marker_maker = trade.get("m") 
                 
-                # DÜZƏLİŞ: AggTrade 'm' bayrağı məntiqi düzəldildi
-                # Binance: m=True (Buyer is maker) => Aggressor is SELL (Təcavüzkar SATIŞ edən tərəfdir)
+                # m=True (Buyer is maker) => Aggressor is SELL
                 if is_marker_maker:
-                    state.big_sells.append((timestamp, notional)) # SELL
+                    state.big_sells.append((timestamp, notional))
                     log_type = "HUGE SELL" if notional >= self.config.HUGE_TRADE_USDT else "BIG SELL"
                 else:
-                    state.big_buys.append((timestamp, notional)) # BUY
+                    state.big_buys.append((timestamp, notional))
                     log_type = "HUGE BUY" if notional >= self.config.HUGE_TRADE_USDT else "BIG BUY"
 
                 logger.info(f"🐳 {log_type}: {symbol} {self.fmt_usd(notional)} @ ${price:.2f}")
 
+    # --- Telegram İşləyicisi ---
+    async def telegram_poller(self):
+        """Telegram API-dən mesajları qəbul edən asinxron tapşırıq"""
+        if not self.tg_bot or not self.dp:
+            logger.warning("Telegram token or chat ID is not set. Skipping Telegram Poller.")
+            return
+
+        logger.info("Starting Telegram Poller (aiogram)")
+        try:
+            # Dispatcher-i işə sal
+            await self.dp.start_polling(self.tg_bot)
+        except Exception as e:
+            logger.error(f"Telegram Poller error: {e}")
+
+    # --- Run Metodu ---
     async def run(self):
         await self.initialize()
         
-        try:
-            await self.tg_send(
+        tasks = [
+            self.market_data_poller(),
+            self.websocket_handler(),
+        ]
+        
+        if self.tg_bot:
+            tasks.append(self.telegram_poller())
+            start_message = (
                 f"🤖 <b>Advanced Whale Signal Bot Started</b>\n"
+                f"Monitoring: {', '.join(self.config.SYMBOLS)}\n"
+                f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"<b>İnteraktiv Rejim Aktivdir.</b> Komandaları yoxlayın (məs: /price BTCUSDT)."
+            )
+        else:
+            start_message = (
+                f"🤖 <b>Advanced Whale Signal Bot Started (Siqnal Yalnız)</b>\n"
                 f"Monitoring: {', '.join(self.config.SYMBOLS)}\n"
                 f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
+        
+        try:
+            await self.tg_send(start_message)
             
-            await asyncio.gather(
-                self.market_data_poller(),
-                self.websocket_handler(),
-                return_exceptions=True
-            )
+            await asyncio.gather(*tasks, return_exceptions=True)
         
         except Exception as e:
             logger.error(f"Bot runtime error: {e}")
