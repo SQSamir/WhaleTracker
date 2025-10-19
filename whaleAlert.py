@@ -105,6 +105,9 @@ class Config:
     COOLDOWN_SEC: int = field(default_factory=lambda: getenv_int("COOLDOWN_SEC", 120))
     MAX_SIGNALS_PER_HOUR: int = field(default_factory=lambda: getenv_int("MAX_SIGNALS_PER_HOUR", 8))
 
+    # NEW: Whether to send SKIP (OI mismatch) notifications to Telegram
+    SEND_SKIP_NOTIFICATIONS: bool = field(default_factory=lambda: getenv_bool("SEND_SKIP_NOTIFICATIONS", False))
+
 # =========================
 # Helpers
 # =========================
@@ -365,12 +368,20 @@ f"""{emoji} <b>WHALE {tier} {direction} — COPY LEVELS</b>
                 oi_ok = oi_pct >= self.cfg.OI_MIN_ABS_PCT
             else:
                 oi_ok = oi_pct <= -self.cfg.OI_MIN_ABS_PCT
+
         if not oi_ok:
-            await self.tg_send(
-                f"⚠️ <b>SKIP (OI uyğunsuzluğu)</b>\n"
-                f"{tier} {('LONG' if side=='BUY' else 'SHORT')} | {symbol} | <code>{fmt_usd(notional)}</code> @ <code>${fmt_price(price)}</code>\n"
-                f"OI Δ ~{self.cfg.OI_WINDOW_MIN}m: <code>{oi_pct:+.2f}%</code>"
-            )
+            # Only log; do NOT send to Telegram unless explicitly enabled.
+            msg = (f"⚠️ SKIP (OI uyğunsuzluğu)\n"
+                   f"{tier} {('LONG' if side=='BUY' else 'SHORT')} | {symbol} | "
+                   f"{fmt_usd(notional)} @ ${fmt_price(price)} | OI Δ ~{self.cfg.OI_WINDOW_MIN}m: {oi_pct:+.2f}%")
+            logger.info(msg)
+            if self.cfg.SEND_SKIP_NOTIFICATIONS:
+                await self.tg_send(
+                    f"⚠️ <b>SKIP (OI uyğunsuzluğu)</b>\n"
+                    f"{tier} {('LONG' if side=='BUY' else 'SHORT')} | {symbol} | "
+                    f"<code>{fmt_usd(notional)}</code> @ <code>${fmt_price(price)}</code>\n"
+                    f"OI Δ ~{self.cfg.OI_WINDOW_MIN}m: <code>{oi_pct:+.2f}%</code>"
+                )
             return
 
         # Build levels (prefer ATR, else percent fallback)
