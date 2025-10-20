@@ -228,7 +228,6 @@ class WhaleCopySignalTG:
 • Stop Price (trigger): <code>{f(stop_price)}</code>
 • Price (limit): <code>{f(limit_price)}</code>
 • Condition: <code>{cond}</code>
-• Tip: <i>TP/SL daxil et: TP1-i əsas TP kimi, TP2/TP3 üçün ayrıca limit orderlər əlavə edə bilərsən.</i>
 
 <i>Xüsusi Qeyd: Bu siqnallar yalnız məlumat üçündür. Riskini özün idarə et.</i>
 """.strip()
