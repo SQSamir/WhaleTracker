@@ -7,6 +7,11 @@ import asyncio, json, logging, os, ssl, time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple, Any
 import aiohttp, websockets
+from typing import Callable as _Callable, Awaitable as _Awaitable
+from zoneinfo import ZoneInfo as _ZoneInfo
+import datetime as _dt
+
+
 
 # ---------- safe env ----------
 def getenv_bool(k:str,d:bool)->bool:
@@ -320,16 +325,6 @@ class WhaleCopySignalTG:
             # ------------------------------------------------------
             await self.websocket_loop()
 
-# =====================================================================
-#                        (ADDED) SESSION NOTIFIER
-# =====================================================================
-# Opening/closing session alerts module. Does not touch existing logic.
-# Sessions (local times): Tokyo 09:00–18:00, London 08:00–17:00, New York 08:00–17:00
-# Sends Telegram alerts at open/close with optional BTC/ETH snapshot.
-
-from typing import Callable as _Callable, Awaitable as _Awaitable
-from zoneinfo import ZoneInfo as _ZoneInfo
-import datetime as _dt
 
 async def _session_tg_send_default(text: str) -> None:
     token = os.getenv("TELEGRAM_TOKEN")
