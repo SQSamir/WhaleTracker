@@ -315,7 +315,165 @@ class WhaleCopySignalTG:
         async with aiohttp.ClientSession(trust_env=True, connector=aiohttp.TCPConnector(ssl=ssl_ctx)) as s:
             self.session=s
             await self.tg_send("🤖 <b>Whale Copy-Signal Bot</b> — Binance-style messages enabled.")
+            # ---- ADDED: start Session Notifier in the same process (background task)
+            asyncio.create_task(run_session_notifier(tg_send_async=self.tg_send))
+            # ------------------------------------------------------
             await self.websocket_loop()
+
+# =====================================================================
+#                        (ADDED) SESSION NOTIFIER
+# =====================================================================
+# Opening/closing session alerts module. Does not touch existing logic.
+# Sessions (local times): Tokyo 09:00–18:00, London 08:00–17:00, New York 08:00–17:00
+# Sends Telegram alerts at open/close with optional BTC/ETH snapshot.
+
+from typing import Callable as _Callable, Awaitable as _Awaitable
+from zoneinfo import ZoneInfo as _ZoneInfo
+import datetime as _dt
+
+async def _session_tg_send_default(text: str) -> None:
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        try:
+            logging.getLogger("SessionNotifier").info("[TG SKIP] %s", text)
+        except Exception:
+            print("[TG SKIP]", text)
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        try:
+            async with s.post(url, json=payload) as r:
+                _ = await r.text()
+        except Exception as e:
+            logging.getLogger("SessionNotifier").error("Telegram send failed: %s", e)
+
+@dataclass(frozen=True)
+class _SessDef:
+    name: str
+    city: str
+    tz: str
+    open_hm: Tuple[int, int]
+    close_hm: Tuple[int, int]
+
+_SESSIONS: List[_SessDef] = [
+    _SessDef("Asia",    "Tokyo",   "Asia/Tokyo",        (9, 0),  (18, 0)),
+    _SessDef("Europe",  "London",  "Europe/London",     (8, 0),  (17, 0)),
+    _SessDef("America", "New York","America/New_York",  (8, 0),  (17, 0)),
+]
+
+@dataclass
+class _SessEvent:
+    when_utc: _dt.datetime
+    kind: str     # "open" | "close"
+    sess: _SessDef
+
+def _loc(d: _dt.date, tz: str, h: int, m: int) -> _dt.datetime:
+    z = _ZoneInfo(tz)
+    return _dt.datetime(d.year, d.month, d.day, h, m, tzinfo=z)
+
+def _events_for(d: _dt.date) -> List[_SessEvent]:
+    out: List[_SessEvent] = []
+    for s in _SESSIONS:
+        o = _loc(d, s.tz, *s.open_hm).astimezone(_dt.timezone.utc)
+        c = _loc(d, s.tz, *s.close_hm).astimezone(_dt.timezone.utc)
+        out.append(_SessEvent(o, "open", s))
+        out.append(_SessEvent(c, "close", s))
+    return out
+
+def _upcoming(now_utc: _dt.datetime) -> List[_SessEvent]:
+    evs = _events_for(now_utc.date()) + _events_for(now_utc.date() + _dt.timedelta(days=1))
+    return sorted([e for e in evs if e.when_utc > now_utc], key=lambda e: e.when_utc)
+
+def _fmt_pct2(x: Optional[float]) -> str:
+    return "—" if x is None else f"{x:+.2f}%"
+
+def _fmt_price2(x: Optional[float]) -> str:
+    return "—" if x is None else f"${x:,.2f}"
+
+async def _fetch_snapshot_default() -> Optional[Dict[str, Dict[str, float]]]:
+    """Simple snapshot via Binance public API: BTC/ETH price, 24h change, funding rate."""
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        out: Dict[str, Dict[str, float]] = {}
+        try:
+            # 24h ticker
+            for sym in ("BTCUSDT","ETHUSDT"):
+                async with s.get("https://fapi.binance.com/fapi/v1/ticker/24hr", params={"symbol": sym}) as r:
+                    j = await r.json(content_type=None)
+                    price = float(j.get("lastPrice","0") or 0.0)
+                    chg = float(j.get("priceChangePercent","0") or 0.0)
+                # funding
+                async with s.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": sym}) as r2:
+                    j2 = await r2.json(content_type=None)
+                    funding = float(j2.get("lastFundingRate","0") or 0.0) * 100.0  # to %
+                out[sym] = {"price": price, "change_24h_pct": chg, "funding": funding}
+            return out
+        except Exception as e:
+            logging.getLogger("SessionNotifier").warning("snapshot error: %s", e)
+            return None
+
+def _compose_session_message(ev: _SessEvent, snap: Optional[Dict[str, Dict[str, float]]]) -> str:
+    ts_loc = ev.when_utc.astimezone(_ZoneInfo(ev.sess.tz))
+    header = "🟢 <b>OPEN</b>" if ev.kind=="open" else "🔴 <b>CLOSE</b>"
+    lines = [
+        f"{header} — {ev.sess.name} ({ev.sess.city}) session",
+        f"🕒 Time: <code>{ts_loc.strftime('%Y-%m-%d %H:%M')} {ev.sess.tz}</code>",
+    ]
+    if snap:
+        b = snap.get("BTCUSDT", {})
+        e = snap.get("ETHUSDT", {})
+        lines += [
+            "📊 <b>Market snapshot</b>",
+            f"• BTC: {_fmt_price2(b.get('price'))} (24h: {_fmt_pct2(b.get('change_24h_pct'))}, funding: {b.get('funding',0):+g}%)",
+            f"• ETH: {_fmt_price2(e.get('price'))} (24h: {_fmt_pct2(e.get('change_24h_pct'))}, funding: {e.get('funding',0):+g}%)",
+        ]
+    lines.append("💡 Tip: Volatility tends to increase around London ↔ New York overlaps.")
+    return "\n".join(lines)
+
+async def run_session_notifier(
+    *,
+    get_snapshot: Optional[_Callable[[], _Awaitable[Optional[Dict[str, Dict[str, float]]]]]] = _fetch_snapshot_default,
+    tg_send_async: Optional[_Callable[[str], _Awaitable[None]]] = None,
+    wakeup_interval_sec: int = 15,
+) -> None:
+    """
+    Session open/close alerts. Does not modify existing code — just run as a background task.
+    - get_snapshot: optional BTC/ETH metrics (price, 24h%, funding).
+    - tg_send_async: your Telegram sender (e.g., bot.tg_send). If not provided, ENV is used.
+    - wakeup_interval_sec: 10–20s recommended for accurate timing.
+    """
+    log = logging.getLogger("SessionNotifier")
+    sender = tg_send_async or _session_tg_send_default
+    fired: set[str] = set()
+    log.info("Session Notifier started.")
+    while True:
+        now = _dt.datetime.now(_dt.timezone.utc)
+        for ev in _upcoming(now)[:8]:
+            key = f"{ev.when_utc.isoformat()}|{ev.kind}|{ev.sess.name}"
+            diff = (ev.when_utc - now).total_seconds()
+            if diff <= 0:
+                continue
+            if diff <= wakeup_interval_sec + 1 and key not in fired:
+                snap = None
+                if get_snapshot:
+                    try:
+                        snap = await get_snapshot()
+                    except Exception as e:
+                        log.warning("get_snapshot error: %s", e)
+                try:
+                    await sender(_compose_session_message(ev, snap))
+                    fired.add(key)
+                    log.info("Sent: %s", key)
+                except Exception as e:
+                    log.error("send failed: %s", e)
+        # cleanup for fired keys
+        if len(fired) > 512:
+            cutoff = (now - _dt.timedelta(days=2)).isoformat()
+            fired = {k for k in fired if k.split("|", 1)[0] >= cutoff}
+        await asyncio.sleep(wakeup_interval_sec)
 
 # ---------- entry ----------
 async def main():
