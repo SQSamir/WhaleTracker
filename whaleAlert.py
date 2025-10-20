@@ -229,7 +229,7 @@ class WhaleCopySignalTG:
 • Price (limit): <code>{f(limit_price)}</code>
 • Condition: <code>{cond}</code>
 
-<i>Xüsusi Qeyd: Bu siqnallar yalnız məlumat üçündür. Riskini özün idarə et.</i>
+<i>Disclaimer: These signals are provided for informational purposes only. Trade responsibly and manage your own risk.</i>
 """.strip()
 
     # ----- WS -----
